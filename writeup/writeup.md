@@ -141,11 +141,11 @@ type Queue1 struct {
 	head, tail *T
 	data       [∞]T
 }
-
 func (q *Queue1) Enqueue(elt T) {
 	for {
 		newTail := atomic.LoadPointer(&q.tail) + 1
 		if atomic.CompareAndSwapT(newTail, nil, elt) {
+			atomic.CompareAndSwap(&q.tail, q.tail, newTail)
 			break
 		}
 	}
@@ -167,13 +167,12 @@ func (q *Queue1) Dequeue() T {
 The second queue will assume that the type `T` can not only take on a `nil`
 value but also an unambiguous `SENTINEL` value that a user is guaranteed not to
 pass in to `Enqueue`. This value is used to mark an index as unusable,
-signalling conflicting `Enqueue` threads that they should try again.
+signalling a conflicting `Enqueue` thread that it should try again.
 
 <!-- If ther is any change to the above psuedocode, change the startFrom line
 here  -->
 
-~~~~ {.go .numberLines startFrom="25"}
-// T ::= nil | SENTINEL | ...
+~~~~ {.go .numberLines startFrom="26"}
 type Queue2 struct {
 	head, ta uint
 	data     [∞]T
@@ -216,14 +215,14 @@ operations need only concern themselves with dequeue operations that increment
 A downside of this approach is that while `Queue1` is lock free, `Queue2` is
 merely obstruction free. For an enqueue/dequeue pair of threads, each can
 continually increment equal `head` and `tail` indices while the dequeuer's CAS
-(line 47) always succeeds before the enqueuer's (line 34) resulting in livelock.
+(line 44) always succeeds before the enqueuer's (line 34) resulting in livelock.
 
 
 ## Lessons for Channels
 
 The `Queue2` above is the core of the implementation of a fast wait-free queue
 in @wfq. It is also the basic idea that we will leverage when designing a more
-scalable queue. The rest of their algorithm consists in solving three problems
+scalable channel. The rest of their algorithm consists in solving three problems
 that have analogs in our setting.
 
   (1) *Simulating an infinite array with a finite amount of memory.* Here the
@@ -479,8 +478,8 @@ the result of senders and receivers being given new responsibilities:
   * Senders must decide if they should block and wait for more receivers to
     arrive.
 
-  * Receivers have to wake up any waiters who out to wake up if they succeed in
-    popping an element off of the queue.
+  * Receivers have to wake up any waiters who ought to wake up if they succeed
+    in popping an element off of the queue.
 
 As before, this protocol is implemented in a manner that avoids blocking unless
 blocking is required by the channel semantics. This means `Enqueue` and
@@ -567,7 +566,7 @@ func (b *BoundedChan) Enqueue(e Elt) {
 				(*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])),
 				unsafe.Pointer(Elt(&w)), unsafe.Pointer(e)) {
 				return
-			} // someone put in a chan Elt into this location. We need to use the slow path
+			} // someone put a waiter into this location. We need to use the slow path
 		} else if atomic.CompareAndSwapPointer(
 			(*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])),
 			sentinel, unsafe.Pointer(e)) {
@@ -778,9 +777,10 @@ These benchmarks were conducted on a machine with 2 Intel Xeon 2620 v4 CPUs each
 with 8 cores clocked at 2.1GHz with two hardware threads per core. We were
 unable to allocate cores in an intuitive manner, so the 16-core benchmark is
 actually using all of a single CPU's hardware threads; only at core-counts
-higher than 16 does the program cross a NUMA-domain. The benchmarks were run on the
-Windows Subsystem for Linux[^wsl]; an implementation of an Ubuntu 14.04 userland from
-within the Windows 10 Operating System.
+higher than 16 does the program cross a NUMA-domain. The benchmarks were run on
+the Windows Subsystem for Linux[^wsl]; an implementation of an Ubuntu 14.04
+userland from within the Windows 10 Operating System. These benchmarks were
+conducted using Go version 1.6.
 
 These numbers were produced by performing 5,000,000 enqueues and dequeues per
 configuration, averaged over 5 iterations per setting, with a full GC between
@@ -788,14 +788,12 @@ iterations.
 
 The benchmarks show that both *Bounded* and *Unbounded* are able to increase
 throughput as the core-count increases. Native Go channels are unable to do so.
-When using more than 4 processors, all three of *Unbounded*, *Bounded0* and
-*Bounded1K* provide much better throughput than native channels regardless of
-buffer size. *Unbounded* in particular is often 3-5x faster than the *Chan*
-configurations, while *Bounded0* continues to increase throughput even after
-crossing a NUMA domain and dipping into using multiple hardware threads per
-core.
-
-
+When using more than 4 processors,  *Unbounded* and *Bounded1K* provide much
+better throughput than native channels regardless of buffer size. *Unbounded* in
+particular is often 2-3x faster than the buffered *Chan* configurations, while
+*Bounded0* continues to increase throughput even after crossing a NUMA domain
+and dipping into using multiple hardware threads per core. At the highest core
+counts, all three new configurations outpace native Go channels.
 
 <!--
 Unbounded channels are consistently faster than both bounded channels and native
@@ -846,13 +844,14 @@ Which we take to be a straight-forward sequential specification for a channel.
 
 Our linearization procedure considers two broad cases, a fast and slow path.
 
-  * In the fast path there is sufficient distance between enqueuers and dequeuers
-  such that the fetch-add of $e_i$ occurs before the fetch-add for $d_i$ *and*
-  $e_i$'s CAS succeeds. In this case, linearize $e_i$ and $d_i$ at their
-  respective fetch-adds.
+  * In the fast path there is sufficient distance between enqueuers and
+    dequeuers such that the fetch-add of $e_i$ occurs before the fetch-add for
+    $d_i$ *and* $e_i$'s CAS succeeds. In this case, linearize $e_i$ and $d_i$ at
+    their respective fetch-adds.
 
-  * In the case where $d_i$'s fetch-add occurs before that of $e_i$ we linearize
-  *both* operations at $e_i$'s fetch-add, with $e_i$ occurring just before $d_i$.
+  * In the case where $d_i$'s fetch-add occurs before that of $e_i$  (or the CAS
+    fails) we linearize *both* operations at $e_i$'s fetch-add, with $e_i$
+    occurring just before $d_i$.
 
 Observe that both cases in this procedure linearize $e_i,d_i$ between them
 starting and finishing. The second case is guaranteed to do so because if $d_i$
@@ -953,6 +952,9 @@ Improving Performance
 : Some variants of this algorithm still perform worse at lower core-counts than
 their native Go equivalents. One possible reason for this is how much allocation
 these queues perform (go channels need only keep a single fix-sized buffer).
+It could be fruitful to experiment with schemes that reduce allocation, as well
+as algorithms that allocate a fix-sized buffer, similar to the CRQ algorithm in
+@lcrq.
 
 
 # Appendix A: Efficient Segment Allocation
