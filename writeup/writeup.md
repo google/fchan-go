@@ -301,6 +301,9 @@ itself are kept locally in an `UnboundedChan` for two reasons
   garbage collector will be able to clean up used segments when (and only when)
   all threads no longer hold a reference to them.
 
+We note that a downside of this design is that inactive threads that hold such a
+handle can cause space leaks by holding onto references to long-dead segments.
+
 Users interact with a channel by first creating an initial value, and later
 cloning that value and others derived from it using `NewHandle`.
 
