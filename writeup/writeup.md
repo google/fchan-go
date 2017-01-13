@@ -45,7 +45,7 @@ send(c: chan T, item: T)                  receive(c: chan T) -> T
                                                   goto begin
 ~~~~
 
-Go channels are currently require goroutines[^goroutine] to acquire a single
+Go channels currently require goroutines[^goroutine] to acquire a single
 lock before performing additional operations[^chanimp]. This makes contention
 for this lock a scalability bottleneck; while acquiring a mutex can be very fast
 this means that only one thread can perform an operation on a queue at a time.
@@ -70,7 +70,7 @@ an overview], but we will focus here on *non-blocking* queues because of the
 approach in that literature to making scalable concurrent data-structures.
 
 Informally, we say a data-structure is non-blocking if no thread can perform an
-operation that will never require it to block any other threads for an unbounded
+operation that will require it to block any other threads for an unbounded
 amount of time.  As a result, no queue that requires a thread to take a lock can
 be non-blocking: one thread can acquire a lock and then be de-scheduled for an
 arbitrary amount of time and thereby block all other threads contending for the
