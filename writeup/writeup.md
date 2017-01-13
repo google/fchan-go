@@ -215,7 +215,8 @@ operations need only concern themselves with dequeue operations that increment
 A downside of this approach is that while `Queue1` is lock free, `Queue2` is
 merely obstruction free. For an enqueue/dequeue pair of threads, each can
 continually increment equal `head` and `tail` indices while the dequeuer's CAS
-(line 44) always succeeds before the enqueuer's (line 34) resulting in livelock.
+(line 44) always succeeds before the enqueuer's (line 34) resulting in
+livelock[^livelockdef].
 
 
 ## Lessons for Channels
@@ -798,20 +799,6 @@ particular is often 2-3x faster than the buffered *Chan* configurations, while
 and dipping into using multiple hardware threads per core. At the highest core
 counts, all three new configurations outpace native Go channels.
 
-<!--
-Unbounded channels are consistently faster than both bounded channels and native
-Go channels, they range from 30% faster (16 threads) to nearly 3 times faster (4
-threads). The bounded channels of buffer size 1024 are consistently faster than
-native channels as well, though by a more narrow margin. The *Bounded0* case
-performs much worse until 32 threads are used, at which point it is faster than
-all configurations other than *Unbounded*. Performance of both *Unbounded* and
-*Bounded* channels does not degrade as drastically as native Go channels when
-using all 32 hardware threads.
-
-Interestingly, there is higher throughput for the scenario where more goroutines are
-spawned in both the unbuffered and the 1024-buffered configuration.
--->
-
 ![](contend_graph.pdf)
 ![](gmp_graph.pdf)
 
@@ -886,17 +873,15 @@ The argument for (1) is the same as in the fast path, and the argument for (3)
 follows by assumption. Once again, the interesting case is to show that we
 maintain an ordering between dequeue operations. There are two possible cases:
 
-$d_{i+1}$ blocks
+(1) *$d_{i+1}$ blocks*
+    We know that $d_{i+1}$ will take the slow path, and will
+    therefore be linearized at a later fetch-add.
 
-: We know that $d_{i+1}$ will take the slow path, and will
-therefore be linearized at a later fetch-add.
-
-$d_{i+1}$ does not block
-
-: The only way that $d_{i+1}$ does not block is if its CAS fails, which means
-that there is another enqueuer $e_{i+1}$ that completed. Regardless of whether
-$d_{i+1}$ is linearized on a slow path or a fast path, it must be after the
-fetch-add in $e_{i+1}$ and hence also that of $e_i$.
+(2) *$d_{i+1}$ does not block*
+    The only way that $d_{i+1}$ does not block is if its CAS fails, which means
+    that there is another enqueuer $e_{i+1}$ that completed. Regardless of whether
+    $d_{i+1}$ is linearized on a slow path or a fast path, it must be after the
+    fetch-add in $e_{i+1}$ and hence also that of $e_i$.
 
 *Small Numbers of Operations*
 
@@ -932,9 +917,9 @@ leverages techniques from the recent literature on non-blocking queues to
 implement (to our knowledge) novel blocking constructs. There are a number of
 avenues for future work.
 
-Verification
+**Verification**
 
-: It will be useful to model both channels in
+It will be useful to model both channels in
 [SPIN](http://spinroot.com/spin/whatispin.html) or
 [TLA+](http://research.microsoft.com/en-us/um/people/lamport/tla/tla.html) to
 provide further assurance that the algorithms are correct. While it would be
@@ -942,17 +927,17 @@ more involved, proving correctness in [Coq](https://coq.inria.fr/) in line with
 techniques mentioned in [FRAP](http://adam.chlipala.net/frap/) would also be
 helpful in building confidence in the algorithms.
 
-Implement in the Go runtime
+**Implement in the Go runtime**
 
-: Implementing these channels within the runtime could further reduce these
+Implementing these channels within the runtime could further reduce these
 algorithms' overhead. In particular they will allow for more efficient
 implementation of the blocking semantics in that they can access goroutine
 and scheduling metadata directly, whereas the current implementation relies on
 `WaitGroup`s, which may be too heavyweight for our purposes.
 
-Improving Performance
+**Improving Performance**
 
-: Some variants of this algorithm still perform worse at lower core-counts than
+Some variants of this algorithm still perform worse at lower core-counts than
 their native Go equivalents. One possible reason for this is how much allocation
 these queues perform (go channels need only keep a single fix-sized buffer).
 It could be fruitful to experiment with schemes that reduce allocation, as well
@@ -1131,3 +1116,7 @@ is unbounded, as are the STM variants.
 [^wsl]: See [this blog post](https://blogs.msdn.microsoft.com/wsl/2016/04/22/windows-subsystem-for-linux-overview/)
 as well as the various [follow-ups](https://blogs.msdn.microsoft.com/wsl/) for
 an overview of this system.
+
+[^livelockdef]: A [livelock](https://en.wikipedia.org/wiki/Deadlock#Livelock) is
+a scenario in which one or more threads never block (i.e. they continuously
+change their respective states) but still indefinitely fail to make progress.
