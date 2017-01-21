@@ -112,7 +112,7 @@ the operation in Go[^fasem]:
 
 ```go
 //atomically
-func AtomicFetchAdd(src *int, delta int) {
+func AtomicFetchAdd(src *int, delta int) int {
   *src += delta
   return *src
 }
