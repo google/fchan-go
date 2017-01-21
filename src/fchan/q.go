@@ -105,23 +105,25 @@ func (w *weakWaiter) Wait() { <-(*w) }
 
 //*
 type weakWaiter struct {
+	e      Elt
 	OSize  int32
 	Size   int32
 	Wgroup sync.WaitGroup
 }
 
-func makeWeakWaiter(i int32) *weakWaiter {
-	wait := &weakWaiter{Size: i, OSize: i}
+func makeWeakWaiter(i int32, e Elt) *weakWaiter {
+	wait := &weakWaiter{Size: i, OSize: i, e: e}
 	wait.Wgroup.Add(1)
 	return wait
 }
 
-func (w *weakWaiter) Signal() {
+func (w *weakWaiter) Signal() Elt {
 	newVal := atomic.AddInt32(&w.Size, -1)
 	orig := atomic.LoadInt32(&w.OSize)
 	if newVal+1 == orig {
 		w.Wgroup.Done()
 	}
+	return w.e
 }
 
 func (w *weakWaiter) Wait() {

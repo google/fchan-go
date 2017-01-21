@@ -130,20 +130,13 @@ func (b *BoundedChan) Enqueue(e Elt) {
 				return
 			}
 		}
-		var w interface{} = makeWeakWaiter(2)
+		var w interface{} = makeWeakWaiter(2, e)
 		if atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])),
 			unsafe.Pointer(nil), unsafe.Pointer(Elt(&w))) {
 			// we successfully swapped in w. No one will overwrite this
 			// location unless they send on w first. We block.
 			w.(*weakWaiter).Wait()
-			// <-(w.(waitch))
-			if atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])),
-				unsafe.Pointer(Elt(&w)), unsafe.Pointer(e)) {
-				if debug {
-					dbgPrint("[enq] blocked then swapped successfully\n")
-				}
-				return
-			} // someone put in a chan Elt into this location. We need to use the slow path
+			return
 		} else if atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])),
 			sentinel, unsafe.Pointer(e)) {
 			// Between us reading startHead and now, there were enough
@@ -164,18 +157,13 @@ func (b *BoundedChan) Enqueue(e Elt) {
 			return
 		}
 	}
-	for i := 0; ; i++ { // will run at most twice
-		if i >= 2 {
-			panic("[enq] bug!")
-		}
-		ptr := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])))
-		w := (*waiter)(ptr)
-		w.Send(e)
-		if debug {
-			dbgPrint("[enq] sending to waiter on %v\n", ptr)
-		}
-		return
+	ptr := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])))
+	w := (*waiter)(ptr)
+	w.Send(e)
+	if debug {
+		dbgPrint("[enq] sending to waiter on %v\n", ptr)
 	}
+	return
 }
 
 // Dequeue receives an Elt from b. It blocks if there are no elements enqueued
@@ -225,21 +213,7 @@ func (b *BoundedChan) Dequeue() Elt {
 		elt := seg.Load(segInd)
 		res = elt
 		if ww, ok := (*elt).(*weakWaiter); ok {
-			ww.Signal()
-			if atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[segInd])),
-				unsafe.Pointer(elt), unsafe.Pointer(w)) {
-				if debug {
-					dbgPrint("[deq] getting res from channel slow %v\n", w)
-				}
-				res = w.Recv()
-			} else {
-				// someone cas'ed a value from a waitchan, could only have been our
-				// friend on the dequeue side
-				if debug {
-					dbgPrint("[deq] getting res from load\n")
-				}
-				res = seg.Load(segInd)
-			}
+			res = ww.Signal()
 		}
 	}
 	for i := 0; b.bound > 0; i++ {
