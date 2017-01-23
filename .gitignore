@@ -1,0 +1,5 @@
+*.swp
+fchan-rs/target
+Cargo.lock
+.DS_Store
+src/bench/bench

@@ -1,0 +1,8 @@
+[package]
+name = "fchan"
+version = "0.1.0"
+authors = ["Eli Rosenthal <ezr@cs.brown.edu>"]
+
+[dependencies]
+crossbeam = "0.2.10"
+time = "0.1"
