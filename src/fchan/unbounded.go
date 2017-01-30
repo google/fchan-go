@@ -20,7 +20,7 @@ import (
 	"unsafe"
 )
 
-// Thread-local state for interacting with an unbounded channel
+// UnboundedChan is a thread-local handle on an unbounded channel
 type UnboundedChan struct {
 	// pointer to global state
 	q *queue
@@ -59,16 +59,58 @@ func (u *UnboundedChan) NewHandle() *UnboundedChan {
 // TODO(ezrosent) enforce that e is not nil, I think we make that assumption
 // here..
 func (u *UnboundedChan) Enqueue(e Elt) {
-	u.adjust() // don't always do this?
-	myInd := index(atomic.AddUint64((*uint64)(&u.q.T), 1) - 1)
-	cell, cellInd := myInd.SplitInd()
-	seg := u.q.findCell(u.tail, cell)
-	if atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])),
-		unsafe.Pointer(nil), unsafe.Pointer(e)) {
-		return
+	for {
+		u.adjust() // don't always do this?
+		myInd := index(atomic.AddUint64((*uint64)(&u.q.T), 1) - 1)
+		cell, cellInd := myInd.SplitInd()
+		seg := u.q.findCell(u.tail, cell)
+		if atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])),
+			unsafe.Pointer(nil), unsafe.Pointer(e)) {
+			return
+		}
+		icw := (*indexedWaiter)(atomic.LoadPointer(
+			(*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd]))))
+		if icw.Cw.send(icw.Ix, e) {
+			break
+		}
 	}
-	wt := (*waiter)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd]))))
-	wt.Send(e)
+}
+
+func (u *UnboundedChan) tryPutWaiter(icw *indexedWaiter) (bool, Elt, func()) {
+	u.adjust()
+	myInd := index(atomic.AddUint64((*uint64)(&u.q.H), 1) - 1)
+	cell, cellInd := myInd.SplitInd()
+	seg := u.q.findCell(u.head, cell)
+	elt := seg.Load(cellInd)
+
+	res := !(elt == nil &&
+		atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])),
+			unsafe.Pointer(nil), unsafe.Pointer(icw)))
+	if res {
+		icw.Cw.cancel()
+		return res, seg.Load(cellInd), nil
+	}
+	return res, nil, nil
+
+}
+
+// WriteThen creates a SelectRecord for a write-select operation.
+func (u *UnboundedChan) WriteThen(i interface{}, cb func()) SelectRecord {
+	return SelectRecord{
+		ch:      u.NewHandle(),
+		cb:      func(interface{}) { cb() },
+		toWrite: &i,
+	}
+}
+
+// Then builds a SelectRecord from an UnboundedChan and a callback to be run if
+// a Select call triggers a Dequeue for the given channel. The result can be
+// passed as an argument to Select.
+func (u *UnboundedChan) Then(f func(interface{})) SelectRecord {
+	return SelectRecord{
+		ch: u.NewHandle(),
+		cb: f,
+	}
 }
 
 // findCell finds a segment at or after start with ID cellID. If one does not
@@ -102,19 +144,19 @@ func (u *UnboundedChan) adjust() {
 
 // Dequeue an element from the channel, will block if nothing is there
 func (u *UnboundedChan) Dequeue() Elt {
-	u.adjust()
-	myInd := index(atomic.AddUint64((*uint64)(&u.q.H), 1) - 1)
-	cell, cellInd := myInd.SplitInd()
-	seg := u.q.findCell(u.head, cell)
-	elt := seg.Load(cellInd)
-	wt := makeWaiter()
-	if elt == nil &&
-		atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.Data[cellInd])),
-			unsafe.Pointer(nil), unsafe.Pointer(wt)) {
-		if debug {
-			dbgPrint("\t[deq] slow path\n")
-		}
-		return wt.Recv()
+	icw := &indexedWaiter{Cw: newCondWaiterOneWay()}
+	if ok, elt, _ := u.tryPutWaiter(icw); ok {
+		return elt
 	}
-	return seg.Load(cellInd)
+	return icw.Cw.validateOneWay()
+}
+
+func (u *UnboundedChan) newHandleGen() chanLike {
+	return u.NewHandle()
+}
+
+func (u *UnboundedChan) putWriteWaiter(e Elt, icw indexedWaiter) (bool, func() bool) {
+	u.Enqueue(e)
+	icw.Cw.cancel()
+	return true, nil
 }

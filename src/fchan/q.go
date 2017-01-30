@@ -21,6 +21,113 @@ import (
 	"unsafe"
 )
 
+type condStatus uint64
+
+const (
+	notReady condStatus = iota
+	cancelled
+	valid
+)
+
+// condWaiter is a type that supports multiple threads to attempt to send a
+// value to a single receiver thread. The receiver thread has the option of
+// cancelling any ongoing send operations.
+type condWaiter struct {
+	status       condStatus
+	sendW, recvW sync.WaitGroup
+	ctr          uint64
+	handle       uint
+	v            Elt
+	sendV        Elt
+}
+
+// newCondWaiterV creates a new condWaiter with a value baked in.
+func newCondWaiterV(e Elt) *condWaiter {
+	res := &condWaiter{
+		status: notReady,
+		ctr:    0,
+		v:      nil,
+		sendV:  e,
+	}
+	res.recvW.Add(1)
+	res.sendW.Add(1)
+	return res
+}
+
+// newCondWaiter creates a new condWaiter.
+func newCondWaiter() *condWaiter {
+	res := &condWaiter{
+		status: notReady,
+		ctr:    0,
+		v:      nil,
+	}
+	res.recvW.Add(1)
+	res.sendW.Add(1)
+	return res
+}
+
+// newCondWaiterOneWay creates a new condWaiter that cannot be
+// cancelled. This is used for channel operations that are not involved in
+// a select.
+func newCondWaiterOneWay() *condWaiter {
+	res := &condWaiter{
+		status: notReady,
+		ctr:    0,
+		v:      nil,
+	}
+	res.status = valid
+	res.recvW.Add(1)
+	return res
+}
+
+// validateOneWay is a receive operation for a oneWay condWaiter.
+func (c *condWaiter) validateOneWay() Elt {
+	c.recvW.Wait()
+	return c.v
+}
+
+// overlappingSend is used in a BoundedChan where it is possible for
+// both a sender and a receiver to wake a waiting thread, and the send
+// should be registered as a success if _either_ goroutine succeeded in
+// the wake operation.
+func (c *condWaiter) overlappingSend(h uint, e Elt) (bool, Elt) {
+	if !atomic.CompareAndSwapUint64(&c.ctr, 0, 1) {
+		c.sendW.Wait()
+		return c.status == valid && c.handle == h, c.sendV
+	}
+	c.handle = h
+	c.v = e
+	c.recvW.Done()
+	c.sendW.Wait()
+	return c.status == valid, c.sendV
+}
+
+func (c *condWaiter) send(h uint, e Elt) bool {
+	if !atomic.CompareAndSwapUint64(&c.ctr, 0, 1) {
+		return false
+	}
+	c.handle = h
+	c.v = e
+	c.recvW.Done()
+	c.sendW.Wait()
+	return c.status == valid
+}
+
+func (c *condWaiter) validate() (uint, Elt) {
+	c.status = valid
+	c.sendW.Done()
+	c.recvW.Wait()
+	return c.handle, c.v
+}
+
+func (c *condWaiter) cancel() {
+	if c.status == valid {
+		return
+	}
+	c.status = cancelled
+	c.sendW.Done()
+}
+
 // basic debug infrastructure
 const debug = false
 
@@ -30,105 +137,6 @@ var dbgPrint = func(s string, i ...interface{}) { fmt.Printf(s, i...) }
 type Elt *interface{}
 type index uint64
 type listElt *segment
-
-type waiter struct {
-	E      Elt
-	Wgroup sync.WaitGroup
-}
-
-func makeWaiter() *waiter {
-	wait := &waiter{}
-	wait.Wgroup.Add(1)
-	return wait
-}
-
-func (w *waiter) Send(e Elt) {
-	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&w.E)), unsafe.Pointer(e))
-	w.Wgroup.Done()
-}
-
-func (w *waiter) Recv() Elt {
-	w.Wgroup.Wait()
-	return Elt(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&w.E))))
-}
-
-/*
-type weakWaiter struct {
-	cond *sync.Cond
-	sync.Mutex
-	woke int64
-}
-
-func makeWeakWaiter(i int32) *weakWaiter {
-	w := &weakWaiter{}
-	w.cond = sync.NewCond(w)
-	return w
-}
-
-func (w *weakWaiter) Signal() {
-	w.Lock()
-	w.woke++
-	w.cond.Signal()
-	w.Unlock()
-}
-
-func (w *weakWaiter) Wait() {
-	w.Lock()
-	for w.woke == 0 {
-		w.cond.Wait()
-	}
-	w.Unlock()
-}
-
-//*/
-
-/*
-
-// Idea to get beyond the scalability bottleneck when number of goroutines is
-// much larger than gomaxprocs. Have an array of channels with large buffers
-// (or unbuffered channels?) and group threads into these larger groups. This
-// means weakWaiters are attached to queue-level state. It has the disadvantage
-// of making ordering a bit more difficult, as later receivers could wake up
-// earlier senders. I think this is fine, but it merits some thought.
-type weakWaiter chan struct{}
-
-func makeWeakWaiter(i int32) *weakWaiter {
-	var ch weakWaiter = make(chan struct{}, i)
-	return &ch
-}
-
-func (w *weakWaiter) Signal() { *w <- struct{}{} }
-
-func (w *weakWaiter) Wait() { <-(*w) }
-
-//*/
-
-//*
-type weakWaiter struct {
-	OSize  int32
-	Size   int32
-	Wgroup sync.WaitGroup
-}
-
-func makeWeakWaiter(i int32) *weakWaiter {
-	wait := &weakWaiter{Size: i, OSize: i}
-	wait.Wgroup.Add(1)
-	return wait
-}
-
-func (w *weakWaiter) Signal() {
-	newVal := atomic.AddInt32(&w.Size, -1)
-	orig := atomic.LoadInt32(&w.OSize)
-	if newVal+1 == orig {
-		w.Wgroup.Done()
-	}
-}
-
-func (w *weakWaiter) Wait() {
-	w.Wgroup.Wait()
-}
-
-// */
 
 // segList is a best-effort data-structure for storing spare segment
 // allocations. The TryPush and TryPop methods follow standard algorithms for
@@ -238,8 +246,10 @@ func (s *segList) TryPop() (e listElt, ok bool) {
 }
 
 // segment size
-const segShift = 12
-const segSize = 1 << segShift
+const (
+	segShift = 12
+	segSize  = 1 << segShift
+)
 
 // The channel buffer is stored as a linked list of fixed-size arrays of size
 // segsize. ID is a monotonically increasing identifier corresponding to the
@@ -321,4 +331,87 @@ func advance(ptr **segment, cell index) {
 		}
 		*ptr = next
 	}
+}
+
+type chanLike interface {
+	tryPutWaiter(*indexedWaiter) (bool, Elt, func())
+	Then(func(interface{})) SelectRecord
+	WriteThen(interface{}, func()) SelectRecord
+	Enqueue(Elt)
+	Dequeue() Elt
+	newHandleGen() chanLike
+	putWriteWaiter(Elt, indexedWaiter) (bool, func() bool)
+}
+
+// SelectRecord is an opaque type containing channel metadata used by Select
+type SelectRecord struct {
+	ch      chanLike
+	cb      func(interface{})
+	toWrite Elt
+}
+
+type indexedWaiter struct {
+	Ix uint
+	Cw *condWaiter
+}
+
+// Select is an implementation of an operation akin to the built-in `select`
+// construct in terms of `UnboundedChan`s and `BoundedChan`s. Select operates on
+// values of the `SelectRecord` type, elements of which can be created by the
+// two channels' `Then` methods. e.g. for any unbounded chans u_i and bounded
+// b_i, one can select on them by calling
+// Select(
+// 	u_0.Then(func(i interface{}) { fmt.Println("u_0 received %v", i) }),
+// 	b_3.Then(...), ... )
+func Select(recs ...SelectRecord) {
+	SelectSlice(append([]SelectRecord{}, recs...))
+}
+
+// SelectSlice is a variant of Select that consumes a slice of `SelectRecord`s
+func SelectSlice(recs []SelectRecord) {
+	cw := newCondWaiter()
+	cleanup := make([]func(), 0, len(recs))
+	defer func() {
+		for _, cb := range cleanup {
+			if cb != nil {
+				cb()
+			}
+		}
+	}()
+	for i := 0; i < len(recs); i++ {
+		u := recs[i].ch
+		icw := indexedWaiter{
+			Ix: uint(i),
+			Cw: cw,
+		}
+		if tw := recs[i].toWrite; tw != nil {
+			ok, cb := u.putWriteWaiter(tw, icw)
+			if ok {
+				recs[i].cb(nil)
+				return
+			}
+			// cleanup for write selects actually complete the enqueue process, so
+			// they have to run before the actual select callback.
+			oldCb := recs[i].cb
+			recs[i].cb = func(i interface{}) {
+				if !cb() {
+					u.Enqueue(tw)
+				}
+				oldCb(i)
+			}
+		} else {
+			ok, elt, cb := u.tryPutWaiter(&icw)
+			if ok {
+				recs[i].cb(*elt)
+				return
+			}
+			cleanup = append(cleanup, cb)
+		}
+	}
+	ix, elt := cw.validate()
+	if elt == nil {
+		recs[ix].cb(nil)
+		return
+	}
+	recs[ix].cb(*elt)
 }
